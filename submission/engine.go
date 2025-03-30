@@ -55,11 +55,7 @@ func handleConn(conn net.Conn, ctx context.Context, coordinatorChan chan *Instru
 
 	// client sends each input to the central goroutine through its outgoing channel.
 	// The central goroutine sends back the relevant instrument through the incoming channel.
-	instrumentRequest := InstrumentRequest{
-		outChan: make(chan utils.Input),
-		inChan:  make(chan *Instrument),
-	}
-
+	replyChan := make(chan *Instrument)
 	idToInstrument := make(map[uint32]chan OrderRequest)
 
 	for {
@@ -91,14 +87,16 @@ func handleConn(conn net.Conn, ctx context.Context, coordinatorChan chan *Instru
 			fmt.Fprintf(os.Stderr, "Got order: %c %v x %v @ %v ID: %v\n",
 				in.OrderType, in.Instrument, in.Count, in.Price, in.OrderId)
 
+			instrumentRequest := InstrumentRequest{
+				input: in,
+				replyChan: replyChan,
+			}
+
 			// poll to request service from central goroutine
 			coordinatorChan <- &instrumentRequest
 
-			// send the input to the central goroutine to process
-			instrumentRequest.outChan <- in
-
 			// receive the instrument from the central goroutine
-			instrument := <-instrumentRequest.inChan
+			instrument := <-instrumentRequest.replyChan
 
 			// send the input to the corresponding instrument channel
 			// then map id to that channel
@@ -146,7 +144,7 @@ func coordinator(ctx context.Context, wg *wg.WaitGroup, coordinatorChan chan *In
 
 		case request := <-coordinatorChan: // a client requests service
 
-			input := <-request.outChan
+			input := request.input
 
 			if _, ok := instrument_map[input.Instrument]; !ok {
 				// instrument not exist, create instrument and
@@ -164,15 +162,15 @@ func coordinator(ctx context.Context, wg *wg.WaitGroup, coordinatorChan chan *In
 				instrument_map[input.Instrument] = &new_instrument
 			}
 
-			request.inChan <- instrument_map[input.Instrument]
+			request.replyChan <- instrument_map[input.Instrument]
 		}
 	}
 }
 
 // A request to the central coordinator to query for instrument
 type InstrumentRequest struct {
-	outChan chan utils.Input
-	inChan  chan *Instrument
+	input utils.Input
+	replyChan chan *Instrument
 }
 
 type Instrument struct {
