@@ -16,13 +16,10 @@ import (
 type Engine struct {
 	wg              *wg.WaitGroup
 	coordinatorChan chan *InstrumentRequest // allows clients to request for coordinator service
-	// cancel          context.CancelFunc
 }
 
 func (e *Engine) Init(ctx context.Context, wg *wg.WaitGroup) {
 	e.wg = wg
-	// context, cancel := context.WithCancel(ctx)
-	// e.cancel = cancel
 
 	e.coordinatorChan = make(chan *InstrumentRequest)
 
@@ -34,9 +31,7 @@ func (e *Engine) Init(ctx context.Context, wg *wg.WaitGroup) {
 func (e *Engine) Shutdown(ctx context.Context) {
 	e.wg.Wait()
 
-	// by this point, all clients have closed connections.
-	// we shutdown the coordinator and instrument routines
-	// e.cancel()
+	// by this point, all go routines are closed
 }
 
 func (e *Engine) Accept(ctx context.Context, conn net.Conn) {
@@ -51,11 +46,11 @@ func (e *Engine) Accept(ctx context.Context, conn net.Conn) {
 	// This goroutine handles the connection.
 	go func() {
 		defer e.wg.Done()
-		handleConn(conn, e.coordinatorChan)
+		handleConn(conn, ctx, e.coordinatorChan)
 	}()
 }
 
-func handleConn(conn net.Conn, coordinatorChan chan *InstrumentRequest) {
+func handleConn(conn net.Conn, ctx context.Context, coordinatorChan chan *InstrumentRequest) {
 	defer conn.Close()
 
 	// client sends each input to the central goroutine through its outgoing channel.
@@ -85,7 +80,12 @@ func handleConn(conn net.Conn, coordinatorChan chan *InstrumentRequest) {
 		case utils.InputCancel:
 			fmt.Fprintf(os.Stderr, "Got cancel ID: %v\n", in.OrderId)
 			cancelChan := idToInstrument[in.OrderId]
-			cancelChan <- orderRequest
+
+			select {
+			case cancelChan <- orderRequest:
+			case <-ctx.Done():
+				return
+			}
 
 		default:
 			fmt.Fprintf(os.Stderr, "Got order: %c %v x %v @ %v ID: %v\n",
@@ -103,17 +103,25 @@ func handleConn(conn net.Conn, coordinatorChan chan *InstrumentRequest) {
 			// send the input to the corresponding instrument channel
 			// then map id to that channel
 			if in.OrderType == utils.InputBuy {
-				instrument.buyChan <- orderRequest
+				select {
+				case instrument.buyChan <- orderRequest:
+				case <-ctx.Done():
+				}
+
 				idToInstrument[in.OrderId] = instrument.cancelBuyChan
 			} else {
-				instrument.sellChan <- orderRequest
+				select {
+				case instrument.sellChan <- orderRequest:
+				case <-ctx.Done():
+				}
+				
 				idToInstrument[in.OrderId] = instrument.cancelSellChan
 			}
 		}
 
 		<-orderRequest.doneChan // prevent client from sending the next request before the current request is processed
 
-		// TODO: also check if context is closed. else go routine may leak?
+		// TODO: if context is cancelled, instrument goroutines may close. Can client get stuck when sending request?
 	}
 }
 
