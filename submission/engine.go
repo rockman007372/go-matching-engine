@@ -106,6 +106,7 @@ func handleConn(conn net.Conn, ctx context.Context, coordinatorChan chan *Instru
 				select {
 				case instrument.buyChan <- orderRequest:
 				case <-ctx.Done():
+					return
 				}
 
 				idToInstrument[in.OrderId] = instrument.cancelBuyChan
@@ -113,8 +114,9 @@ func handleConn(conn net.Conn, ctx context.Context, coordinatorChan chan *Instru
 				select {
 				case instrument.sellChan <- orderRequest:
 				case <-ctx.Done():
+					return
 				}
-				
+
 				idToInstrument[in.OrderId] = instrument.cancelSellChan
 			}
 		}
