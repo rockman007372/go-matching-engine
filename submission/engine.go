@@ -112,6 +112,8 @@ func handleConn(conn net.Conn, coordinatorChan chan *InstrumentRequest) {
 		}
 
 		<-orderRequest.doneChan // prevent client from sending the next request before the current request is processed
+
+		// TODO: also check if context is closed. else go routine may leak?
 	}
 }
 
@@ -199,6 +201,7 @@ func (ins *Instrument) sellInstrumentManager(ctx context.Context, wg *wg.WaitGro
 		case request := <-ins.buyChan:
 			activeBuyOrder := &request.activeOrder
 
+		start:
 			// match with resting sell orders
 			for restingSellOrders.Len() > 0 && activeBuyOrder.Count > 0 {
 				restingSellOrder := (*restingSellOrders)[0] // peek the top
@@ -225,40 +228,29 @@ func (ins *Instrument) sellInstrumentManager(ctx context.Context, wg *wg.WaitGro
 
 			// send leftover to other goroutine
 			if activeBuyOrder.Count > 0 {
-				addChan <- request
+
+				select {
+				case addSellRequest := <-addChan:
+					// add to order book
+					addSellOrder(addSellRequest.activeOrder, restingSellOrders, idToOrder)
+					close(addSellRequest.doneChan)
+
+					goto start // recheck again
+
+				case addChan <- request:
+				}
+
 			} else {
 				close(request.doneChan)
 			}
 
 		case request := <-addChan:
 
-			// add matched sell order to the resting queue
-			timestamp := GetCurrentTimestamp()
-
-			sellOrder := Order{
-				OrderID:     request.activeOrder.OrderId,
-				Price:       request.activeOrder.Price,
-				Count:       request.activeOrder.Count,
-				ExecutionID: 1,
-				Timestamp:   uint32(timestamp),
-				Valid:       true,
-			}
-
-			idToOrder[sellOrder.OrderID] = &sellOrder
-			heap.Push(restingSellOrders, &sellOrder)
-
-			utils.OutputOrderAdded(request.activeOrder, timestamp)
+			addSellOrder(request.activeOrder, restingSellOrders, idToOrder)
 			close(request.doneChan)
 
 		case request := <-ins.cancelSellChan:
-			orderId := request.activeOrder.OrderId
-			order := idToOrder[orderId]
-			isValid := order.Valid
-			if isValid {
-				order.Valid = false
-			}
-
-			utils.OutputOrderDeleted(request.activeOrder, isValid, GetCurrentTimestamp())
+			cancelOrder(request.activeOrder, idToOrder)
 			close(request.doneChan)
 
 		}
@@ -279,6 +271,7 @@ func (ins *Instrument) buyInstrumentManager(ctx context.Context, wg *wg.WaitGrou
 		case request := <-ins.sellChan:
 			activeSellOrder := &request.activeOrder
 
+		start:
 			// match with resting sell orders
 			for restingBuyOrders.Len() > 0 && activeSellOrder.Count > 0 {
 				restingBuyOrder := (*restingBuyOrders)[0] // peek the top
@@ -305,43 +298,83 @@ func (ins *Instrument) buyInstrumentManager(ctx context.Context, wg *wg.WaitGrou
 
 			// send leftover to other goroutine
 			if activeSellOrder.Count > 0 {
-				addChan <- request
+
+				select {
+				case addBuyRequest := <-addChan:
+					// add to order book
+					addBuyOrder(addBuyRequest.activeOrder, restingBuyOrders, idToOrder)
+					close(addBuyRequest.doneChan)
+
+					goto start // recheck again
+
+				case addChan <- request:
+				}
+
 			} else {
 				close(request.doneChan)
 			}
 
 		case request := <-addChan:
-
-			// add matched sell order to the resting queue
-			timestamp := GetCurrentTimestamp()
-
-			buyOrder := Order{
-				OrderID:     request.activeOrder.OrderId,
-				Price:       request.activeOrder.Price,
-				Count:       request.activeOrder.Count,
-				ExecutionID: 1,
-				Timestamp:   uint32(timestamp),
-				Valid:       true,
-			}
-
-			idToOrder[buyOrder.OrderID] = &buyOrder
-			heap.Push(restingBuyOrders, &buyOrder)
-
-			utils.OutputOrderAdded(request.activeOrder, timestamp)
+			addBuyOrder(request.activeOrder, restingBuyOrders, idToOrder)
 			close(request.doneChan)
 
 		case request := <-ins.cancelBuyChan:
-			orderId := request.activeOrder.OrderId
-			order := idToOrder[orderId]
-			isValid := order.Valid
-			if isValid {
-				order.Valid = false
-			}
-
-			utils.OutputOrderDeleted(request.activeOrder, isValid, GetCurrentTimestamp())
+			cancelOrder(request.activeOrder, idToOrder)
 			close(request.doneChan)
 
 		}
+	}
+}
+
+func addBuyOrder(input utils.Input, restingBuyOrders *MaxHeap, idToOrder map[uint32]*Order) {
+	timestamp := GetCurrentTimestamp()
+
+	buyOrder := Order{
+		OrderID:     input.OrderId,
+		Price:       input.Price,
+		Count:       input.Count,
+		ExecutionID: 1,
+		Timestamp:   timestamp,
+		Valid:       true,
+	}
+
+	idToOrder[buyOrder.OrderID] = &buyOrder
+	heap.Push(restingBuyOrders, &buyOrder)
+
+	utils.OutputOrderAdded(input, timestamp)
+}
+
+func addSellOrder(input utils.Input, restingSellOrders *MinHeap, idToOrder map[uint32]*Order) {
+	timestamp := GetCurrentTimestamp()
+
+	sellOrder := Order{
+		OrderID:     input.OrderId,
+		Price:       input.Price,
+		Count:       input.Count,
+		ExecutionID: 1,
+		Timestamp:   timestamp,
+		Valid:       true,
+	}
+
+	idToOrder[sellOrder.OrderID] = &sellOrder
+	heap.Push(restingSellOrders, &sellOrder)
+
+	utils.OutputOrderAdded(input, timestamp)
+}
+
+func cancelOrder(input utils.Input, idToOrder map[uint32]*Order) {
+
+	if order, ok := idToOrder[input.OrderId]; !ok {
+		// This means the order was never added! it was fully matched earlier
+		utils.OutputOrderDeleted(input, false, GetCurrentTimestamp())
+	} else {
+		// if order is valid, it has not been deleted
+		isValid := order.Valid
+		if isValid {
+			order.Valid = false
+		}
+
+		utils.OutputOrderDeleted(input, isValid, GetCurrentTimestamp())
 	}
 }
 
@@ -358,7 +391,7 @@ type Order struct {
 	Price       uint32
 	Count       uint32
 	ExecutionID uint32
-	Timestamp   uint32
+	Timestamp   int64
 	Valid       bool
 }
 
@@ -367,9 +400,13 @@ type MinHeap []*Order
 func (h MinHeap) Len() int      { return len(h) }
 func (h MinHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 func (h MinHeap) Less(i, j int) bool {
-	var o1, o2 *Order
-	o1, o2 = h[i], h[j] // Go automatically dereference pointers!
-	return (o1.Price < o2.Price) || (o1.Price == o2.Price && o1.Timestamp < o2.Timestamp)
+	if h[i].Price == h[j].Price {
+		if h[i].Timestamp == h[j].Timestamp {
+			return h[i].OrderID < h[j].OrderID
+		}
+		return h[i].Timestamp < h[j].Timestamp
+	}
+	return h[i].Price < h[j].Price
 }
 
 func (h *MinHeap) Push(x any) {
@@ -377,10 +414,11 @@ func (h *MinHeap) Push(x any) {
 }
 
 func (h *MinHeap) Pop() any {
-	n := len(*h)
-	res := (*h)[n-1]
-	*h = (*h)[:n-1]
-	return res
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
 }
 
 type MaxHeap []*Order
@@ -388,9 +426,13 @@ type MaxHeap []*Order
 func (h MaxHeap) Len() int      { return len(h) }
 func (h MaxHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 func (h MaxHeap) Less(i, j int) bool {
-	var o1, o2 *Order
-	o1, o2 = h[i], h[j]
-	return (o1.Price > o2.Price) || (o1.Price == o2.Price && o1.Timestamp < o2.Timestamp)
+	if h[i].Price == h[j].Price {
+		if h[i].Timestamp == h[j].Timestamp {
+			return h[i].OrderID < h[j].OrderID
+		}
+		return h[i].Timestamp < h[j].Timestamp
+	}
+	return h[i].Price > h[j].Price
 }
 
 func (h *MaxHeap) Push(x any) {
@@ -398,8 +440,9 @@ func (h *MaxHeap) Push(x any) {
 }
 
 func (h *MaxHeap) Pop() any {
-	n := len(*h)
-	res := (*h)[n-1]
-	*h = (*h)[:n-1]
-	return res
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
 }
